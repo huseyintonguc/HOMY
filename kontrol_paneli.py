@@ -8,19 +8,20 @@ from streamlit_autorefresh import st_autorefresh
 
 # --- Streamlit Arayüzü ve Ayarları ---
 st.set_page_config(layout="wide")
-st.title("Trendyol Otomasyon Kontrol Paneli")
+st.title("Trendyol Otomasyon Kontrol Paneli (7/24 Aktif)")
 
-# --- API Bilgilerini Güvenli Olarak Oku ---
-# Bu bilgiler Streamlit Cloud'un "Secrets" bölümünden okunacak
+# --- API Bilgilerini ve Ayarları Güvenli Olarak Oku ---
 try:
     SELLER_ID = st.secrets["SELLER_ID"]
     API_KEY = st.secrets["API_KEY"]
     API_SECRET = st.secrets["API_SECRET"]
     openai.api_key = st.secrets["OPENAI_API_KEY"]
+    AUTO_APPROVE_CLAIMS = st.secrets.get("AUTO_APPROVE_CLAIMS", False)
+    AUTO_ANSWER_QUESTIONS = st.secrets.get("AUTO_ANSWER_QUESTIONS", False)
+    DELAY_MINUTES = st.secrets.get("DELAY_MINUTES", 5)
 except KeyError as e:
     st.error(f"'{e.args[0]}' adlı gizli bilgi (Secret) bulunamadı. Lütfen 'Manage app' -> 'Secrets' bölümünü kontrol edin.")
     st.stop()
-
 
 # --- Trendyol API için kimlik bilgileri hazırlanıyor ---
 credentials = f"{API_KEY}:{API_SECRET}"
@@ -32,23 +33,21 @@ HEADERS = {
 }
 
 # Sayfa otomatik yenileme
-st_autorefresh(interval=20 * 1000, key="data_fetch_refresher")
+st_autorefresh(interval=30 * 1000, key="data_fetch_refresher")
 
 # --- FONKSİYONLAR: İADE/TALEP YÖNETİMİ ---
 
 def get_pending_claims():
-    """Onay bekleyen talepleri API'den çeker."""
-    url = f"https://apigw.trendyol.com/integration/order/sellers/{SELLER_ID}/claims?claimItemStatus=WaitingInAction&size=100&page=0"
+    url = f"https://apigw.trendyol.com/integration/order/sellers/{SELLER_ID}/claims?claimItemStatus=WaitingInAction&size=50&page=0"
     try:
         response = requests.get(url, headers=HEADERS)
-        response.raise_for_status() # Hata varsa direkt exception fırlatır
+        response.raise_for_status()
         return response.json().get('content', [])
     except Exception as e:
         st.error(f"İade/Talep Talepleri çekilirken bir hata oluştu: {e}")
         return []
 
 def approve_claim_items(claim_id, claim_item_ids):
-    """Belirli bir talebin kalemlerini onaylar."""
     url = f"https://apigw.trendyol.com/integration/order/sellers/{SELLER_ID}/claims/{claim_id}/items/approve"
     data = {"claimLineItemIdList": claim_item_ids, "params": {}}
     try:
@@ -63,6 +62,9 @@ def load_past_data(file_path):
     try:
         df = pd.read_excel(file_path)
         return df[['Ürün İsmi', 'Soru Detayı', 'Onaylanan Cevap']]
+    except FileNotFoundError:
+        st.warning(f"'{file_path}' dosyası bulunamadı. Lütfen GitHub deponuza bu isimde bir Excel dosyası yükleyin.")
+        return None
     except Exception as e:
         st.error(f"Excel dosyası okunurken bir hata oluştu: {e}")
         return None
@@ -80,14 +82,17 @@ def get_waiting_questions():
 def generate_answer(product_name, question, past_df):
     if not openai.api_key:
         return "OpenAI API anahtarı 'Secrets' içinde bulunamadı."
-    examples = past_df[past_df['Ürün İsmi'].str.contains(product_name, case=False, na=False)] if past_df is not None else []
+    examples = pd.DataFrame()
+    if past_df is not None:
+        mask = past_df['Ürün İsmi'].astype(str).str.contains(str(product_name), case=False, na=False)
+        examples = past_df[mask]
+
     prompt = f"Sen bir müşteri temsilcisisin. Aşağıdaki soruya, geçmişte verilen cevapları örnek alarak, nazik, yardımsever ve kısa bir cevap ver.\n\n"
     prompt += f"Ürün Adı: {product_name}\nMüşteri Sorusu: {question}\n\n--- Örnek Geçmiş Cevaplar ---\n"
     for _, row in examples.head(5).iterrows():
         prompt += f"Soru: {row['Soru Detayı']}\nCevap: {row['Onaylanan Cevap']}\n---\n"
     prompt += "Oluşturulacak Cevap:"
     try:
-        # openai v1.0.0 ve sonrası için create metodu değişti
         client = openai.OpenAI(api_key=openai.api_key)
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -110,27 +115,22 @@ def send_answer(question_id, answer_text):
 
 # --- ANA KONTROL PANELİ ARAYÜZÜ ---
 
-st.sidebar.header("Genel Kontrol Ayarları")
-st.sidebar.subheader("İade/Talep Onaylama")
-auto_approve_claims = st.sidebar.checkbox("İadeleri/Talepleri Otomatik Onayla", value=False)
-st.sidebar.subheader("Müşteri Soruları Yanıtlama")
-auto_answer_questions = st.sidebar.checkbox("Soruları Otomatik Cevapla", value=False)
-delay_minutes = st.sidebar.slider(
-    "Otomatik Cevaplama Gecikmesi (dakika)",
-    min_value=0, max_value=60, value=5, step=1,
-    disabled=not auto_answer_questions
-)
-uploaded_file = st.sidebar.file_uploader("Geçmiş Soru-Cevap Excel'i", type=["xlsx"])
+EXCEL_FILE_NAME = "soru_cevap_ornekleri.xlsx"
+past_df = load_past_data(EXCEL_FILE_NAME)
 
-past_df = None
-if uploaded_file:
-    past_df = load_past_data(uploaded_file)
-    if past_df is not None:
-        st.sidebar.success("Geçmiş Soru-Cevap verisi yüklendi.")
+st.sidebar.header("Otomasyon Durumu")
+st.sidebar.markdown(f"**İade Onaylama:** `{'Aktif' if AUTO_APPROVE_CLAIMS else 'Pasif'}`")
+st.sidebar.markdown(f"**Soru Cevaplama:** `{'Aktif' if AUTO_ANSWER_QUESTIONS else 'Pasif'}`")
+if AUTO_ANSWER_QUESTIONS:
+    st.sidebar.markdown(f"**Cevap Gecikmesi:** `{DELAY_MINUTES} dakika`")
+
+if past_df is not None:
+    st.sidebar.success("Soru-cevap örnekleri başarıyla yüklendi.")
+else:
+    st.sidebar.warning("Soru-cevap örnek dosyası bulunamadı veya okunamadı.")
 
 col1, col2 = st.columns(2)
 
-# --- BÖLÜM 1: İADE/TALEP YÖNETİMİ ---
 with col1:
     st.subheader("Onay Bekleyen İade/Talepler")
     try:
@@ -144,14 +144,14 @@ with col1:
                     st.write(f"**Talep Nedeni:** {claim.get('claimType', {}).get('name', 'Belirtilmemiş')}")
                     st.write(f"**Durum:** {claim.get('status')}")
 
-                    if auto_approve_claims:
+                    if AUTO_APPROVE_CLAIMS:
                         with st.spinner("Otomatik olarak onaylanıyor..."):
                             item_ids = [item.get('id') for batch in claim.get('items', []) for item in batch.get('claimItems', [])]
                             if item_ids:
                                 success, message = approve_claim_items(claim.get('id'), item_ids)
                                 if success:
                                     st.success("Talep başarıyla otomatik onaylandı.")
-                                    st.rerun() # Listeyi yenilemek için
+                                    st.rerun()
                                 else:
                                     st.error(f"Otomatik onay başarısız: {message}")
                             else:
@@ -159,8 +159,6 @@ with col1:
     except Exception as e:
         st.error(f"İade/Talep bölümünde bir hata oluştu: {e}")
 
-
-# --- BÖLÜM 2: MÜŞTERİ SORULARI YÖNETİMİ ---
 with col2:
     st.subheader("Cevap Bekleyen Müşteri Soruları")
     try:
@@ -186,8 +184,8 @@ with col2:
                     
                     elapsed = datetime.now() - st.session_state[f"time_{q_id}"]
 
-                    if auto_answer_questions:
-                        if delay_minutes == 0 or elapsed >= timedelta(minutes=delay_minutes):
+                    if AUTO_ANSWER_QUESTIONS:
+                        if DELAY_MINUTES == 0 or elapsed >= timedelta(minutes=DELAY_MINUTES):
                             with st.spinner(f"Soru ID {q_id}: Otomatik cevap gönderiliyor..."):
                                 gpt_answer = generate_answer(q.get("productName", ""), q.get("text", ""), past_df)
                                 st.info(f"Otomatik gönderilen cevap:\n\n> {gpt_answer}")
@@ -200,13 +198,13 @@ with col2:
                                 else:
                                     st.error(f"Cevap gönderilemedi: {message}")
                         else:
-                            remaining_seconds = (timedelta(minutes=delay_minutes) - elapsed).total_seconds()
+                            remaining_seconds = (timedelta(minutes=DELAY_MINUTES) - elapsed).total_seconds()
                             remaining_minutes = int(remaining_seconds / 60)
                             remaining_sec = int(remaining_seconds % 60)
                             st.warning(f"Bu soruya otomatik cevap yaklaşık **{remaining_minutes} dakika {remaining_sec} saniye** içinde gönderilecek.")
                     
-                    else:
-                        answer_suggestion = generate_answer(q.get("productName", ""), q.get("text", ""), past_df)
+                    else: # Manuel mod
+                        answer_suggestion = generate_answer(q.get("product_name", ""), q.get("text", ""), past_df)
                         cevap = st.text_area("Cevabınız:", value=answer_suggestion, key=f"manual_{q_id}")
                         if st.button(f"Cevabı Gönder (ID: {q_id})", key=f"btn_{q_id}"):
                             success, message = send_answer(q_id, cevap)
